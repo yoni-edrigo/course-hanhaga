@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>נוכחות</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1a1a1a; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #2563eb; --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 16px; max-width: 720px; margin-inline: auto;
+  }
+  .header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 16px; gap: 12px; }
+  h1 { font-size: 22px; margin: 0; }
+  #status { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: #e5e7eb; color: var(--muted); white-space: nowrap; }
+  #status.synced { background: #dcfce7; color: #166534; }
+  #status.pending { background: #fef3c7; color: #92400e; }
+  #status.offline { background: #fee2e2; color: #991b1b; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  select, input[type="date"] {
+    width: 100%; padding: 10px 12px; font-size: 16px;
+    border: 1px solid var(--line); border-radius: 8px; background: #fff; font-family: inherit;
+  }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .student {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px; border-bottom: 1px solid var(--line);
+    cursor: pointer; user-select: none;
+  }
+  .student:last-child { border-bottom: 0; }
+  .student input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--ok); flex-shrink: 0; }
+  .student.present { background: #f0fdf4; }
+  .name { font-size: 17px; }
+  .actions { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; margin-top: 8px; }
+  button {
+    width: 100%; padding: 14px; font-size: 17px; font-weight: 600;
+    background: var(--accent); color: white; border: 0; border-radius: 10px;
+    cursor: pointer; font-family: inherit;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .muted { color: var(--muted); font-size: 14px; padding: 12px; text-align: center; }
+  .toast {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    background: #111; color: #fff; padding: 10px 16px; border-radius: 8px;
+    font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 100;
+  }
+  .toast.show { opacity: 1; }
+  .summary-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 14px; color: var(--muted); }
+  .toolbar a { color: var(--accent); cursor: pointer; text-decoration: underline; margin-inline-start: 8px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>רישום נוכחות</h1>
+  <span id="status">…</span>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div>
+      <label for="group">קבוצה</label>
+      <select id="group"><option>טוען…</option></select>
+    </div>
+    <div>
+      <label for="date">תאריך</label>
+      <input type="date" id="date" />
+    </div>
+  </div>
+</div>
+
+<div class="card" id="rosterCard">
+  <div class="summary-row">
+    <span id="summary">בחרו קבוצה</span>
+    <span class="toolbar">
+      <a id="markAll">סמן הכל</a>
+      <a id="clearAll">נקה</a>
+    </span>
+  </div>
+  <div id="roster"></div>
+</div>
+
+<div class="actions">
+  <button id="save" disabled>שמירת נוכחות</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyfm5UvONXmBVoLjjAFICxCGutGdz2hUZrUt94DVhgsC6svdE_sSHPwNQs9TX7um9SF/exec';
+
+// ═══════════════════════════════════════════════════════════════
+// IndexedDB layer — three stores: meta, rosters, attendance
+// ═══════════════════════════════════════════════════════════════
+const DB_NAME = 'attendance-app';
+const DB_VERSION = 1;
+let _db;
+
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, DB_VERSION);
+    r.onupgradeneeded = () => {
+      const db = r.result;
+      if (!db.objectStoreNames.contains('meta'))       db.createObjectStore('meta');
+      if (!db.objectStoreNames.contains('rosters'))    db.createObjectStore('rosters');
+      if (!db.objectStoreNames.contains('attendance')) db.createObjectStore('attendance');
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror   = () => rej(r.error);
+  });
+}
+function idbGet(store, key) {
+  return new Promise((res, rej) => {
+    const r = _db.transaction(store).objectStore(store).get(key);
+    r.onsuccess = () => res(r.result);
+    r.onerror   = () => rej(r.error);
+  });
+}
+function idbPut(store, key, value) {
+  return new Promise((res, rej) => {
+    const r = _db.transaction(store, 'readwrite').objectStore(store).put(value, key);
+    r.onsuccess = () => res();
+    r.onerror   = () => rej(r.error);
+  });
+}
+function idbAll(store) {
+  return new Promise((res, rej) => {
+    const items = [];
+    const r = _db.transaction(store).objectStore(store).openCursor();
+    r.onsuccess = () => {
+      const c = r.result;
+      if (c) { items.push({ key: c.key, value: c.value }); c.continue(); }
+      else res(items);
+    };
+    r.onerror = () => rej(r.error);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// API
+// ═══════════════════════════════════════════════════════════════
+async function api(action, payload = {}) {
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action, ...payload })
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || 'שגיאה');
+  return json.data;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DOM
+// ═══════════════════════════════════════════════════════════════
+const $ = s => document.querySelector(s);
+const groupSel = $('#group'), dateInp = $('#date'), rosterEl = $('#roster');
+const summaryEl = $('#summary'), saveBtn = $('#save'), toastEl = $('#toast'), statusEl = $('#status');
+
+const LS_GROUP = 'attendance.group';
+let currentRoster = []; // [{ rowIndex, firstName, lastName, present }]
+let loadToken = 0;      // race-guard for stale fetches
+
+dateInp.value = new Date().toISOString().slice(0, 10);
+
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  setTimeout(() => toastEl.classList.remove('show'), 2200);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+const attKey = (group, date) => `${group}|${date}`;
+
+// ═══════════════════════════════════════════════════════════════
+// Sync status indicator
+// ═══════════════════════════════════════════════════════════════
+async function updateSyncStatus() {
+  const all = await idbAll('attendance');
+  const dirty = all.filter(({ value }) => value && value.dirty).length;
+  const online = navigator.onLine;
+  statusEl.classList.remove('synced', 'pending', 'offline');
+  if (!online) { statusEl.textContent = 'אופליין'; statusEl.classList.add('offline'); }
+  else if (dirty) { statusEl.textContent = `ממתין לסנכרון (${dirty})`; statusEl.classList.add('pending'); }
+  else { statusEl.textContent = 'מסונכרן'; statusEl.classList.add('synced'); }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Render
+// ═══════════════════════════════════════════════════════════════
+function updateSummary() {
+  if (!currentRoster.length) { summaryEl.textContent = ''; return; }
+  const n = currentRoster.filter(s => s.present).length;
+  summaryEl.textContent = `${n} / ${currentRoster.length} נוכחים`;
+}
+
+function renderRoster() {
+  if (!currentRoster.length) {
+    rosterEl.innerHTML = '<div class="muted">אין תלמידים בקבוצה זו</div>';
+    summaryEl.textContent = '';
+    return;
+  }
+  updateSummary();
+  rosterEl.innerHTML = currentRoster.map((s, i) => `
+    <label class="student ${s.present ? 'present' : ''}" data-i="${i}">
+      <input type="checkbox" ${s.present ? 'checked' : ''} />
+      <span class="name">${escapeHtml(s.firstName)} ${escapeHtml(s.lastName)}</span>
+    </label>
+  `).join('');
+
+  rosterEl.querySelectorAll('.student').forEach(el => {
+    const i = +el.dataset.i;
+    const cb = el.querySelector('input');
+    cb.addEventListener('change', () => {
+      currentRoster[i].present = cb.checked;
+      el.classList.toggle('present', cb.checked);
+      updateSummary();
+    });
+  });
+}
+
+function setAll(val) { currentRoster.forEach(s => s.present = val); renderRoster(); }
+
+// ═══════════════════════════════════════════════════════════════
+// Groups — stale-while-revalidate
+// ═══════════════════════════════════════════════════════════════
+async function loadGroups() {
+  const cached = await idbGet('meta', 'groups');
+  if (cached) renderGroupOptions(cached);
+
+  try {
+    const fresh = await api('getGroups');
+    await idbPut('meta', 'groups', fresh);
+    if (JSON.stringify(cached) !== JSON.stringify(fresh)) renderGroupOptions(fresh);
+  } catch (e) {
+    if (!cached) {
+      groupSel.innerHTML = '<option>שגיאה בטעינה</option>';
+      toast('אין חיבור — לא נטענו קבוצות');
+    }
+  }
+  updateSyncStatus();
+}
+
+function renderGroupOptions(groups) {
+  groupSel.innerHTML =
+    '<option value="">— בחרו —</option>' +
+    groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
+  const saved = localStorage.getItem(LS_GROUP);
+  if (saved && groups.includes(saved)) {
+    groupSel.value = saved;
+    loadRoster();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Roster + attendance — render cache instantly, refresh from server
+// ═══════════════════════════════════════════════════════════════
+async function loadRoster() {
+  const group = groupSel.value;
+  const date  = dateInp.value;
+  const token = ++loadToken;
+
+  if (!group) {
+    currentRoster = [];
+    rosterEl.innerHTML = '';
+    summaryEl.textContent = 'בחרו קבוצה';
+    saveBtn.disabled = true;
+    return;
+  }
+
+  // 1. Instant render from cache (if any)
+  const cachedRoster = await idbGet('rosters', group);
+  const cachedAtt    = await idbGet('attendance', attKey(group, date));
+
+  if (cachedRoster) {
+    const presentMap = {};
+    (cachedAtt?.records || []).forEach(r => {
+      presentMap[r.firstName + '||' + r.lastName] = !!r.present;
+    });
+    currentRoster = cachedRoster.map(s => ({
+      ...s,
+      present: !!presentMap[s.firstName + '||' + s.lastName]
+    }));
+    renderRoster();
+    saveBtn.disabled = currentRoster.length === 0;
+  } else {
+    summaryEl.textContent = 'טוען…';
+    rosterEl.innerHTML = '';
+  }
+
+  // 2. Background refresh from server
+  try {
+    const fresh = await api('getRoster', { group, date });
+    if (token !== loadToken) return; // user moved on
+
+    const rosterOnly = fresh.map(s => ({
+      rowIndex: s.rowIndex, group: s.group,
+      firstName: s.firstName, lastName: s.lastName
+    }));
+    await idbPut('rosters', group, rosterOnly);
+
+    // Only adopt the server's present-state if local isn't dirty
+    if (!cachedAtt?.dirty) {
+      const records = fresh.map(s => ({
+        rowIndex: s.rowIndex,
+        firstName: s.firstName, lastName: s.lastName,
+        present: !!s.present
+      }));
+      await idbPut('attendance', attKey(group, date), {
+        group, date, records, dirty: false, syncedAt: Date.now()
+      });
+      currentRoster = fresh.map(s => ({
+        rowIndex: s.rowIndex, group: s.group,
+        firstName: s.firstName, lastName: s.lastName,
+        present: !!s.present
+      }));
+      renderRoster();
+      saveBtn.disabled = currentRoster.length === 0;
+    }
+  } catch (e) {
+    if (!cachedRoster) summaryEl.textContent = 'אין חיבור ולא נמצא מטמון';
+  }
+  updateSyncStatus();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Save — write IDB first, then sync
+// ═══════════════════════════════════════════════════════════════
+async function save() {
+  const group = groupSel.value, date = dateInp.value;
+  if (!group || !date) { toast('בחרו קבוצה ותאריך'); return; }
+
+  const records = currentRoster.map(s => ({
+    rowIndex: s.rowIndex,
+    firstName: s.firstName, lastName: s.lastName,
+    present: !!s.present
+  }));
+
+  // 1. Write locally
+  await idbPut('attendance', attKey(group, date), {
+    group, date, records, dirty: true, savedAt: Date.now()
+  });
+  toast('נשמר ✓');
+  updateSyncStatus();
+
+  // 2. Try server
+  trySyncOne(group, date);
+}
+
+async function trySyncOne(group, date) {
+  const entry = await idbGet('attendance', attKey(group, date));
+  if (!entry || !entry.dirty) return;
+  try {
+    await api('saveAttendance', { group, date, records: entry.records });
+    await idbPut('attendance', attKey(group, date), {
+      ...entry, dirty: false, syncedAt: Date.now()
+    });
+  } catch (e) {
+    // stays dirty for next retry
+  }
+  updateSyncStatus();
+}
+
+async function syncAllDirty() {
+  const all = await idbAll('attendance');
+  for (const { value } of all) {
+    if (value && value.dirty) await trySyncOne(value.group, value.date);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Wire-up
+// ═══════════════════════════════════════════════════════════════
+groupSel.addEventListener('change', () => {
+  localStorage.setItem(LS_GROUP, groupSel.value);
+  loadRoster();
+});
+dateInp.addEventListener('change', loadRoster);
+$('#markAll').addEventListener('click', () => setAll(true));
+$('#clearAll').addEventListener('click', () => setAll(false));
+saveBtn.addEventListener('click', save);
+
+window.addEventListener('online',  () => { updateSyncStatus(); syncAllDirty(); });
+window.addEventListener('offline', updateSyncStatus);
+
+// Try to sync periodically (cheap; only acts if dirty)
+setInterval(syncAllDirty, 30000);
+
+(async () => {
+  _db = await openDB();
+  await updateSyncStatus();
+  await syncAllDirty();   // replay anything left over from a previous session
+  await loadGroups();
+})();
+</script>
+</body>
+</html>
