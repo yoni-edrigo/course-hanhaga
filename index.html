@@ -7,7 +7,7 @@
 <style>
   :root {
     --bg: #f6f7f9; --card: #fff; --text: #1a1a1a; --muted: #6b7280;
-    --line: #e5e7eb; --accent: #2563eb; --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+    --line: #e5e7eb; --accent: #2563eb; --ok: #16a34a;
   }
   * { box-sizing: border-box; }
   body {
@@ -29,6 +29,18 @@
   }
   .row { display: flex; gap: 12px; }
   .row > div { flex: 1; }
+
+  /* Mode segmented control */
+  .mode {
+    display: flex; background: #eef2f6; border-radius: 10px; padding: 4px; margin-bottom: 14px;
+  }
+  .mode button {
+    flex: 1; background: transparent; color: var(--muted); padding: 10px;
+    font-size: 15px; font-weight: 600; border: 0; border-radius: 7px; cursor: pointer;
+    font-family: inherit; transition: background .15s;
+  }
+  .mode button.active { background: #fff; color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+
   .student {
     display: flex; align-items: center; gap: 12px;
     padding: 12px; border-bottom: 1px solid var(--line);
@@ -37,14 +49,18 @@
   .student:last-child { border-bottom: 0; }
   .student input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--ok); flex-shrink: 0; }
   .student.present { background: #f0fdf4; }
+  /* In bus mode: student absent from main session */
+  .student.absent-main { background: #fef2f2; }
+  .student.absent-main.present { background: #fef0ee; }
+  .student .meta { font-size: 12px; color: var(--muted); margin-inline-start: auto; }
   .name { font-size: 17px; }
   .actions { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; margin-top: 8px; }
-  button {
+  button.save {
     width: 100%; padding: 14px; font-size: 17px; font-weight: 600;
     background: var(--accent); color: white; border: 0; border-radius: 10px;
     cursor: pointer; font-family: inherit;
   }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.save:disabled { opacity: 0.5; cursor: not-allowed; }
   .muted { color: var(--muted); font-size: 14px; padding: 12px; text-align: center; }
   .toast {
     position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
@@ -54,6 +70,8 @@
   .toast.show { opacity: 1; }
   .summary-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 14px; color: var(--muted); }
   .toolbar a { color: var(--accent); cursor: pointer; text-decoration: underline; margin-inline-start: 8px; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .legend .swatch { display: inline-block; width: 10px; height: 10px; background: #fef2f2; border: 1px solid #fecaca; border-radius: 2px; margin-inline-end: 4px; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -63,11 +81,16 @@
   <span id="status">…</span>
 </div>
 
+<div class="mode">
+  <button id="mode-group" class="active">מפגש</button>
+  <button id="mode-bus">אוטובוס</button>
+</div>
+
 <div class="card">
   <div class="row">
     <div>
-      <label for="group">קבוצה</label>
-      <select id="group"><option>טוען…</option></select>
+      <label for="key" id="keyLabel">קבוצה</label>
+      <select id="key"><option>טוען…</option></select>
     </div>
     <div>
       <label for="date">תאריך</label>
@@ -85,10 +108,13 @@
     </span>
   </div>
   <div id="roster"></div>
+  <div class="legend" id="legend" style="display:none">
+    <span class="swatch"></span> תלמיד לא נוכח במפגש
+  </div>
 </div>
 
 <div class="actions">
-  <button id="save" disabled>שמירת נוכחות</button>
+  <button class="save" id="save" disabled>שמירת נוכחות</button>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -99,10 +125,10 @@
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyfm5UvONXmBVoLjjAFICxCGutGdz2hUZrUt94DVhgsC6svdE_sSHPwNQs9TX7um9SF/exec';
 
 // ═══════════════════════════════════════════════════════════════
-// IndexedDB layer — three stores: meta, rosters, attendance
+// IndexedDB — separate stores for group and bus data
 // ═══════════════════════════════════════════════════════════════
 const DB_NAME = 'attendance-app';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let _db;
 
 function openDB() {
@@ -110,9 +136,11 @@ function openDB() {
     const r = indexedDB.open(DB_NAME, DB_VERSION);
     r.onupgradeneeded = () => {
       const db = r.result;
-      if (!db.objectStoreNames.contains('meta'))       db.createObjectStore('meta');
-      if (!db.objectStoreNames.contains('rosters'))    db.createObjectStore('rosters');
-      if (!db.objectStoreNames.contains('attendance')) db.createObjectStore('attendance');
+      if (!db.objectStoreNames.contains('meta'))          db.createObjectStore('meta');
+      if (!db.objectStoreNames.contains('rosters'))       db.createObjectStore('rosters');
+      if (!db.objectStoreNames.contains('attendance'))    db.createObjectStore('attendance');
+      if (!db.objectStoreNames.contains('busRosters'))    db.createObjectStore('busRosters');
+      if (!db.objectStoreNames.contains('busAttendance')) db.createObjectStore('busAttendance');
     };
     r.onsuccess = () => res(r.result);
     r.onerror   = () => rej(r.error);
@@ -163,12 +191,17 @@ async function api(action, payload = {}) {
 // DOM
 // ═══════════════════════════════════════════════════════════════
 const $ = s => document.querySelector(s);
-const groupSel = $('#group'), dateInp = $('#date'), rosterEl = $('#roster');
-const summaryEl = $('#summary'), saveBtn = $('#save'), toastEl = $('#toast'), statusEl = $('#status');
+const keySel = $('#key'), keyLabel = $('#keyLabel'), dateInp = $('#date');
+const rosterEl = $('#roster'), summaryEl = $('#summary'), saveBtn = $('#save');
+const toastEl = $('#toast'), statusEl = $('#status'), legendEl = $('#legend');
 
+const LS_MODE = 'attendance.mode';
 const LS_GROUP = 'attendance.group';
-let currentRoster = []; // [{ rowIndex, firstName, lastName, present }]
-let loadToken = 0;      // race-guard for stale fetches
+const LS_BUS   = 'attendance.bus';
+
+let mode = localStorage.getItem(LS_MODE) || 'group'; // 'group' | 'bus'
+let currentRoster = []; // [{ rowIndex, firstName, lastName, present, groupPresent? }]
+let loadToken = 0;
 
 dateInp.value = new Date().toISOString().slice(0, 10);
 
@@ -177,19 +210,70 @@ function toast(msg) {
   toastEl.classList.add('show');
   setTimeout(() => toastEl.classList.remove('show'), 2200);
 }
-
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 }
 
-const attKey = (group, date) => `${group}|${date}`;
+// Per-mode config — keeps the rest of the code generic
+const modeCfg = {
+  group: {
+    label: 'קבוצה',
+    listAction: 'getGroups',
+    rosterAction: 'getRoster',
+    saveAction: 'saveAttendance',
+    keyField: 'group',
+    lsKey: LS_GROUP,
+    listStore: 'meta',
+    listIdbKey: 'groups',
+    rosterStore: 'rosters',
+    attStore: 'attendance',
+    pickPlaceholder: 'בחרו קבוצה'
+  },
+  bus: {
+    label: 'אוטובוס',
+    listAction: 'getBuses',
+    rosterAction: 'getBusRoster',
+    saveAction: 'saveBusAttendance',
+    keyField: 'bus',
+    lsKey: LS_BUS,
+    listStore: 'meta',
+    listIdbKey: 'buses',
+    rosterStore: 'busRosters',
+    attStore: 'busAttendance',
+    pickPlaceholder: 'בחרו אוטובוס'
+  }
+};
+
+function cfg() { return modeCfg[mode]; }
+const attKey = (k, d) => `${k}|${d}`;
 
 // ═══════════════════════════════════════════════════════════════
-// Sync status indicator
+// Mode switch
+// ═══════════════════════════════════════════════════════════════
+function setMode(next) {
+  if (next === mode) return;
+  mode = next;
+  localStorage.setItem(LS_MODE, mode);
+  $('#mode-group').classList.toggle('active', mode === 'group');
+  $('#mode-bus').classList.toggle('active', mode === 'bus');
+  keyLabel.textContent = cfg().label;
+  legendEl.style.display = mode === 'bus' ? 'block' : 'none';
+  currentRoster = [];
+  rosterEl.innerHTML = '';
+  summaryEl.textContent = cfg().pickPlaceholder;
+  saveBtn.disabled = true;
+  loadList();
+}
+
+$('#mode-group').addEventListener('click', () => setMode('group'));
+$('#mode-bus').addEventListener('click', () => setMode('bus'));
+
+// ═══════════════════════════════════════════════════════════════
+// Sync status
 // ═══════════════════════════════════════════════════════════════
 async function updateSyncStatus() {
-  const all = await idbAll('attendance');
+  const all = [...await idbAll('attendance'), ...await idbAll('busAttendance')];
   const dirty = all.filter(({ value }) => value && value.dirty).length;
   const online = navigator.onLine;
   statusEl.classList.remove('synced', 'pending', 'offline');
@@ -209,17 +293,24 @@ function updateSummary() {
 
 function renderRoster() {
   if (!currentRoster.length) {
-    rosterEl.innerHTML = '<div class="muted">אין תלמידים בקבוצה זו</div>';
+    rosterEl.innerHTML = '<div class="muted">אין רשומות</div>';
     summaryEl.textContent = '';
     return;
   }
   updateSummary();
-  rosterEl.innerHTML = currentRoster.map((s, i) => `
-    <label class="student ${s.present ? 'present' : ''}" data-i="${i}">
-      <input type="checkbox" ${s.present ? 'checked' : ''} />
-      <span class="name">${escapeHtml(s.firstName)} ${escapeHtml(s.lastName)}</span>
-    </label>
-  `).join('');
+  rosterEl.innerHTML = currentRoster.map((s, i) => {
+    const classes = ['student'];
+    if (s.present) classes.push('present');
+    if (mode === 'bus' && s.groupPresent === false) classes.push('absent-main');
+    const meta = (mode === 'bus' && s.group) ? `<span class="meta">קב ${escapeHtml(s.group)}</span>` : '';
+    return `
+      <label class="${classes.join(' ')}" data-i="${i}">
+        <input type="checkbox" ${s.present ? 'checked' : ''} />
+        <span class="name">${escapeHtml(s.firstName)} ${escapeHtml(s.lastName)}</span>
+        ${meta}
+      </label>
+    `;
+  }).join('');
 
   rosterEl.querySelectorAll('.student').forEach(el => {
     const i = +el.dataset.i;
@@ -235,55 +326,60 @@ function renderRoster() {
 function setAll(val) { currentRoster.forEach(s => s.present = val); renderRoster(); }
 
 // ═══════════════════════════════════════════════════════════════
-// Groups — stale-while-revalidate
+// List (groups/buses) — stale-while-revalidate
 // ═══════════════════════════════════════════════════════════════
-async function loadGroups() {
-  const cached = await idbGet('meta', 'groups');
-  if (cached) renderGroupOptions(cached);
+async function loadList() {
+  const c = cfg();
+  const cached = await idbGet(c.listStore, c.listIdbKey);
+  if (cached) renderListOptions(cached);
 
   try {
-    const fresh = await api('getGroups');
-    await idbPut('meta', 'groups', fresh);
-    if (JSON.stringify(cached) !== JSON.stringify(fresh)) renderGroupOptions(fresh);
+    const fresh = await api(c.listAction);
+    await idbPut(c.listStore, c.listIdbKey, fresh);
+    if (JSON.stringify(cached) !== JSON.stringify(fresh)) renderListOptions(fresh);
   } catch (e) {
     if (!cached) {
-      groupSel.innerHTML = '<option>שגיאה בטעינה</option>';
-      toast('אין חיבור — לא נטענו קבוצות');
+      keySel.innerHTML = '<option>שגיאה בטעינה</option>';
+      toast('אין חיבור');
     }
   }
   updateSyncStatus();
 }
 
-function renderGroupOptions(groups) {
-  groupSel.innerHTML =
-    '<option value="">— בחרו —</option>' +
-    groups.map(g => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join('');
-  const saved = localStorage.getItem(LS_GROUP);
-  if (saved && groups.includes(saved)) {
-    groupSel.value = saved;
+function renderListOptions(items) {
+  const c = cfg();
+  keySel.innerHTML =
+    `<option value="">— בחרו —</option>` +
+    items.map(x => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
+  const saved = localStorage.getItem(c.lsKey);
+  if (saved && items.includes(saved)) {
+    keySel.value = saved;
     loadRoster();
+  } else {
+    summaryEl.textContent = c.pickPlaceholder;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Roster + attendance — render cache instantly, refresh from server
+// Roster + attendance
 // ═══════════════════════════════════════════════════════════════
 async function loadRoster() {
-  const group = groupSel.value;
-  const date  = dateInp.value;
+  const c = cfg();
+  const key = keySel.value;
+  const date = dateInp.value;
   const token = ++loadToken;
 
-  if (!group) {
+  if (!key) {
     currentRoster = [];
     rosterEl.innerHTML = '';
-    summaryEl.textContent = 'בחרו קבוצה';
+    summaryEl.textContent = c.pickPlaceholder;
     saveBtn.disabled = true;
     return;
   }
 
-  // 1. Instant render from cache (if any)
-  const cachedRoster = await idbGet('rosters', group);
-  const cachedAtt    = await idbGet('attendance', attKey(group, date));
+  // 1. Instant render from cache
+  const cachedRoster = await idbGet(c.rosterStore, key);
+  const cachedAtt = await idbGet(c.attStore, attKey(key, date));
 
   if (cachedRoster) {
     const presentMap = {};
@@ -301,32 +397,28 @@ async function loadRoster() {
     rosterEl.innerHTML = '';
   }
 
-  // 2. Background refresh from server
+  // 2. Fresh from server
   try {
-    const fresh = await api('getRoster', { group, date });
-    if (token !== loadToken) return; // user moved on
+    const fresh = await api(c.rosterAction, { [c.keyField]: key, date });
+    if (token !== loadToken) return;
 
-    const rosterOnly = fresh.map(s => ({
-      rowIndex: s.rowIndex, group: s.group,
-      firstName: s.firstName, lastName: s.lastName
-    }));
-    await idbPut('rosters', group, rosterOnly);
+    // Cache the roster (without per-date state)
+    const rosterOnly = fresh.map(s => {
+      const { present, ...rest } = s;
+      return rest;
+    });
+    await idbPut(c.rosterStore, key, rosterOnly);
 
-    // Only adopt the server's present-state if local isn't dirty
     if (!cachedAtt?.dirty) {
       const records = fresh.map(s => ({
         rowIndex: s.rowIndex,
         firstName: s.firstName, lastName: s.lastName,
         present: !!s.present
       }));
-      await idbPut('attendance', attKey(group, date), {
-        group, date, records, dirty: false, syncedAt: Date.now()
+      await idbPut(c.attStore, attKey(key, date), {
+        key, date, records, dirty: false, syncedAt: Date.now()
       });
-      currentRoster = fresh.map(s => ({
-        rowIndex: s.rowIndex, group: s.group,
-        firstName: s.firstName, lastName: s.lastName,
-        present: !!s.present
-      }));
+      currentRoster = fresh.map(s => ({ ...s, present: !!s.present }));
       renderRoster();
       saveBtn.disabled = currentRoster.length === 0;
     }
@@ -337,11 +429,12 @@ async function loadRoster() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Save — write IDB first, then sync
+// Save
 // ═══════════════════════════════════════════════════════════════
 async function save() {
-  const group = groupSel.value, date = dateInp.value;
-  if (!group || !date) { toast('בחרו קבוצה ותאריך'); return; }
+  const c = cfg();
+  const key = keySel.value, date = dateInp.value;
+  if (!key || !date) { toast('בחרו ' + c.label + ' ותאריך'); return; }
 
   const records = currentRoster.map(s => ({
     rowIndex: s.rowIndex,
@@ -349,43 +442,43 @@ async function save() {
     present: !!s.present
   }));
 
-  // 1. Write locally
-  await idbPut('attendance', attKey(group, date), {
-    group, date, records, dirty: true, savedAt: Date.now()
+  await idbPut(c.attStore, attKey(key, date), {
+    key, date, records, dirty: true, savedAt: Date.now()
   });
   toast('נשמר ✓');
   updateSyncStatus();
 
-  // 2. Try server
-  trySyncOne(group, date);
+  trySyncOne(mode, key, date);
 }
 
-async function trySyncOne(group, date) {
-  const entry = await idbGet('attendance', attKey(group, date));
+async function trySyncOne(m, key, date) {
+  const c = modeCfg[m];
+  const entry = await idbGet(c.attStore, attKey(key, date));
   if (!entry || !entry.dirty) return;
   try {
-    await api('saveAttendance', { group, date, records: entry.records });
-    await idbPut('attendance', attKey(group, date), {
+    await api(c.saveAction, { [c.keyField]: key, date, records: entry.records });
+    await idbPut(c.attStore, attKey(key, date), {
       ...entry, dirty: false, syncedAt: Date.now()
     });
-  } catch (e) {
-    // stays dirty for next retry
-  }
+  } catch (e) { /* stays dirty */ }
   updateSyncStatus();
 }
 
 async function syncAllDirty() {
-  const all = await idbAll('attendance');
-  for (const { value } of all) {
-    if (value && value.dirty) await trySyncOne(value.group, value.date);
+  for (const m of ['group', 'bus']) {
+    const c = modeCfg[m];
+    const all = await idbAll(c.attStore);
+    for (const { value } of all) {
+      if (value && value.dirty) await trySyncOne(m, value.key, value.date);
+    }
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // Wire-up
 // ═══════════════════════════════════════════════════════════════
-groupSel.addEventListener('change', () => {
-  localStorage.setItem(LS_GROUP, groupSel.value);
+keySel.addEventListener('change', () => {
+  localStorage.setItem(cfg().lsKey, keySel.value);
   loadRoster();
 });
 dateInp.addEventListener('change', loadRoster);
@@ -395,15 +488,20 @@ saveBtn.addEventListener('click', save);
 
 window.addEventListener('online',  () => { updateSyncStatus(); syncAllDirty(); });
 window.addEventListener('offline', updateSyncStatus);
-
-// Try to sync periodically (cheap; only acts if dirty)
 setInterval(syncAllDirty, 30000);
 
 (async () => {
   _db = await openDB();
+  // Initial UI from saved mode
+  $('#mode-group').classList.toggle('active', mode === 'group');
+  $('#mode-bus').classList.toggle('active', mode === 'bus');
+  keyLabel.textContent = cfg().label;
+  legendEl.style.display = mode === 'bus' ? 'block' : 'none';
+  summaryEl.textContent = cfg().pickPlaceholder;
+
   await updateSyncStatus();
-  await syncAllDirty();   // replay anything left over from a previous session
-  await loadGroups();
+  await syncAllDirty();
+  await loadList();
 })();
 </script>
 </body>
