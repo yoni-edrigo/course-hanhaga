@@ -435,6 +435,11 @@ async function save() {
   const c = cfg();
   const key = keySel.value, date = dateInp.value;
   if (!key || !date) { toast('בחרו ' + c.label + ' ותאריך'); return; }
+  if (!currentRoster.length) { toast('אין רשומות לשמור'); return; }
+
+  const originalLabel = saveBtn.textContent;
+  saveBtn.disabled = true;
+  saveBtn.textContent = 'שומר…';
 
   const records = currentRoster.map(s => ({
     rowIndex: s.rowIndex,
@@ -442,13 +447,38 @@ async function save() {
     present: !!s.present
   }));
 
-  await idbPut(c.attStore, attKey(key, date), {
-    key, date, records, dirty: true, savedAt: Date.now()
-  });
-  toast('נשמר ✓');
+  // 1. Local save first — instant, durable, survives network failure
+  try {
+    await idbPut(c.attStore, attKey(key, date), {
+      key, date, records, dirty: true, savedAt: Date.now()
+    });
+  } catch (e) {
+    saveBtn.disabled = false;
+    saveBtn.textContent = originalLabel;
+    toast('שגיאה בשמירה מקומית: ' + e.message);
+    return;
+  }
   updateSyncStatus();
 
-  trySyncOne(mode, key, date);
+  // 2. Try server sync immediately; report real outcome
+  if (!navigator.onLine) {
+    toast('נשמר מקומית – יסתנכרן כשיחזור החיבור');
+  } else {
+    try {
+      await api(c.saveAction, { [c.keyField]: key, date, records });
+      await idbPut(c.attStore, attKey(key, date), {
+        key, date, records, dirty: false, syncedAt: Date.now()
+      });
+      toast('נשמר ✓');
+    } catch (e) {
+      // Stays dirty in IDB; background sync will retry
+      toast('נשמר מקומית – שגיאת שרת: ' + (e.message || 'לא ידוע'));
+    }
+  }
+
+  updateSyncStatus();
+  saveBtn.disabled = false;
+  saveBtn.textContent = originalLabel;
 }
 
 async function trySyncOne(m, key, date) {
